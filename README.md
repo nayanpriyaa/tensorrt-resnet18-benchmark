@@ -91,10 +91,10 @@ Measurements are from the Windows native build on an NVIDIA GeForce RTX 3050 6GB
 
 These are repeat-run measurements, not a formal multi-run statistical benchmark. The first batch-1 run was unusually noisy, so the table below uses the subsequent repeat runs.
 
-| Precision | I/O | Batch | Mean batch ms | p50 ms | p90 ms | p99 ms | H2D ms | H2D GB/s | Compute ms | Throughput (images/s) | Accuracy gate | max|Δ| |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|
-| FP16 | pinned | 1 | 0.507 | 0.504 | 0.546 | 0.612 | 0.078 | 7.7 | 0.441 | 1973.3 | PASS (1/1 top-1) | 1.44e-2 |
-| FP16 | pinned | 2 | 0.808 | 0.795 | 0.843 | 0.891 | 0.124 | 9.7 | 0.684 | 2475.2 | PASS (2/2 top-1) | 1.27e-2 |
+| Precision | I/O    | Batch | Mean batch ms | p50 ms | p90 ms | p99 ms | H2D ms | H2D GB/s | Compute ms | Throughput (images/s) | Accuracy gate | Max diff |
+|-----------|--------|-------|---------------|--------|--------|--------|--------|-----------|------------|-----------------------|---------------|----------|
+| FP16      | pinned | 1     | 0.507         | 0.504  | 0.546  | 0.612  | 0.078  | 7.7       | 0.441      | 1973.3                | PASS (1/1)    | 1.44e-2  |
+| FP16      | pinned | 2     | 0.808         | 0.795  | 0.843  | 0.891  | 0.124  | 9.7       | 0.684      | 2475.2                | PASS (2/2)    | 1.27e-2  |
 
 Additional accuracy details:
 - Batch 1: mean absolute difference `3.13e-3`, cosine similarity `0.999997`.
