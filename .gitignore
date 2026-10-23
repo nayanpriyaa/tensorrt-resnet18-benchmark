@@ -1,0 +1,28 @@
+
+# Build outputs
+build/
+build-win/
+cmake-build-*/
+
+# TensorRT engines
+*.engine
+
+# Generated model and benchmark artifacts
+artifacts/
+*.onnx
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
