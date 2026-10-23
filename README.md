@@ -1,140 +1,211 @@
-# ResNet-18 → ONNX → TensorRT (C++) on an RTX 3050 laptop
+# ResNet-18 → ONNX → TensorRT C++ Benchmark
 
-PyTorch ResNet-18 exported to ONNX, compiled into a TensorRT engine through the C++ API, and benchmarked on Windows with an NVIDIA RTX 3050 6GB Laptop GPU. The current implementation supports configurable static batch sizes and compares TensorRT logits against PyTorch FP32 reference logits.
+A C++ TensorRT inference benchmark for ResNet-18 on an NVIDIA RTX 3050 Laptop GPU (6 GB, Ampere, SM 86) under Windows. It exports a PyTorch model to ONNX, builds TensorRT engines, and measures where batch-1 latency goes (compute vs. host↔device transfer) across precisions (FP32 / TF32 / FP16), host-memory modes (pinned / pageable / zero-copy) and batch sizes (1–8).
 
-1. **Precision:** strict FP32 vs TF32 vs FP16. Each run reports latency and accuracy against the PyTorch FP32 logits.
-2. **Host↔device memory path:** pinned vs pageable vs zero-copy host memory. This measures what crossing PCIe actually costs on a discrete GPU, instead of asserting it.
+> **Scope:** inputs and reference logits are synthetic. Results show performance and numerical parity on synthetic data, **not ImageNet accuracy**. Each configuration was run twice; treat the numbers as a local snapshot of one laptop.
 
-| File | Role |
+## Key results
+
+| Finding | Result |
 |---|---|
-| `export_to_onnx.py` | ResNet-18 → static `[N,3,224,224]` ONNX (`--batch N`), ONNX Runtime parity check, dumps `input.bin` + `ref_output.bin` |
-| `TrtPipeline.h/.cpp` | ONNX parse, engine build + on-disk cache, pinned / pageable / zero-copy I/O, `enqueueV3` inference |
-| `main.cpp` | Batch-aware warm-up and inference, latency percentiles, CUDA-event H2D/compute/D2H breakdown, effective PCIe GB/s, batch-aware top-1 and numerical accuracy gates, images/s throughput |
-| `CMakeLists.txt` | Links `CUDA::cudart`, `nvinfer`, `nvonnxparser`; Windows (MSVC) and Linux/WSL2 |
+| FP16 vs FP32 (batch 1, pinned) | **2.31× faster** (0.508 vs 1.174 ms) |
+| TF32 vs FP32 | **No measurable gain** (1.165 vs 1.174 ms, within noise), as expected on GeForce Ampere |
+| H2D transfer model | **≈ 32 µs fixed + 12.8 GB/s** (linear fit over batch 1–8, R² = 0.9999) |
+| Transfer share of batch-1 latency | **6.6–6.8 % in FP32 → 15–16 % in FP16** |
+| Zero-copy vs pinned | **−4.3 % in FP16, +3.3 % in FP32**: sign flips with precision (cause unverified) |
+| FP16 memory footprint | activations **4.60 → 2.30 MiB**, serialized plan **58.8 → 22.6 MiB** |
+| Batch 8 vs batch 1 (FP16) | **+91 % throughput** at 4.19× batch latency |
+| FP16 numerical error | max \|Δ\| 1.3–1.7e-2 on logits, cosine ≥ 0.999997 (FP32: 6.7e-6) |
 
-## Hardware context
+## Hardware and software
 
-- **GPU:** NVIDIA GeForce RTX 3050 6GB Laptop GPU (sm_86), connected to the CPU over PCIe.
-- **Why the I/O experiment exists:** the GPU reads its own GDDR6 at roughly 10× the speed of the PCIe link. Every byte that has to come from host RAM is the expensive kind.
-- **Edge relevance:** Jetson Orin's GPU is the same Ampere generation (sm_87), so the precision results and Tensor Core behaviour carry over. The memory system does not carry over (PCIe + GDDR6 here, shared LPDDR5 on Jetson). That is exactly what the `--io` experiment exposes, and why zero-copy flips from a loss here to a win on Jetson.
-- **Robot framing:** TurtleBot 3/4 carry a Raspberry Pi with no CUDA GPU. In the standard setup, the robot streams sensor topics over Wi-Fi via ROS 2 to a "Remote PC", which is this laptop. Moving a camera frame over Wi-Fi usually costs an order of magnitude more than this inference, so at the system level the bottleneck is transport, not the engine.
+- GPU: NVIDIA GeForce RTX 3050 Laptop GPU, 6 GB, compute capability 8.6
+- CUDA Toolkit 12.8, TensorRT 10.15.1.29, Windows
+- Model: torchvision ResNet-18, input `N × 3 × 224 × 224`, 1,000 classes
 
-## Pick a TensorRT version
+**Not yet captured:** driver version, CPU/RAM, Windows build, power mode, negotiated PCIe link. To record them, run this while the benchmark is running (laptop PCIe links drop to a lower generation when idle):
 
-Both versions compile from the same source.
+```cmd
+nvidia-smi --query-gpu=name,driver_version,pcie.link.gen.current,pcie.link.width.current,clocks.sm,power.draw,temperature.gpu --format=csv
+systeminfo
+```
 
-| | TensorRT 10.x | TensorRT 11.x |
-|---|---|---|
-| CUDA | 12.x | 13.x (driver R580+); the C++ zip/tar packages target CUDA 13 |
-| FP16 | `BuilderFlag::kFP16` (weak typing) | Removed. FP16 comes from the graph: `python export_to_onnx.py --fp16-onnx` (needs `pip install "nvidia-modelopt[onnx]"`) |
-| Verdict | Fewest moving parts. Start here. | Current API. Rebuild against it afterwards; "same code, both typing models" is a good interview point |
+## Repository layout
 
-## Build and run: Windows (native)
+```text
+.
+├── CMakeLists.txt
+├── main.cpp            # benchmark harness: timing, stage breakdown, numerical checks
+├── TrtPipeline.h       # engine build/cache, host-I/O modes, inference
+├── TrtPipeline.cpp
+├── export_to_onnx.py   # PyTorch → static-shape ONNX + synthetic input/reference binaries
+├── README.md
+├── LICENSE
+├── .gitignore
+└── artifacts/          # generated by export_to_onnx.py (gitignored)
+    ├── batch1/
+    ├── batch2/
+    ├── batch4/
+    └── batch8/
+```
 
-Prerequisites:
+## Requirements
+
+- Windows 10/11 x64
 - Visual Studio 2022 with the "Desktop development with C++" workload
-- CUDA Toolkit
-- TensorRT zip, extracted to e.g. `C:\TensorRT-10.x.y.z`
-- CMake ≥ 3.18
-- Python 3
+- CMake
+- NVIDIA driver, CUDA Toolkit, TensorRT (C++ headers and libraries)
+- Python packages:
 
-```powershell
-pip install torch torchvision onnx onnxscript onnxruntime
-python export_to_onnx.py
-
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DTENSORRT_ROOT=C:/TensorRT-10.x.y.z
-cmake --build build --config Release
-
-# TensorRT DLLs must be on PATH (bin\ on recent releases, lib\ on some older 10.x zips)
-$env:PATH = "C:\TensorRT-10.x.y.z\bin;C:\TensorRT-10.x.y.z\lib;" + $env:PATH
-.\build\Release\trt_resnet18.exe --io all     # run from this folder: it reads resnet18.onnx / *.bin from here
+```cmd
+python -m pip install torch torchvision onnx onnxscript onnxruntime
 ```
 
-## Build and run: Linux or WSL2
+## Export test artifacts
 
-- **WSL2:** install only the Windows NVIDIA driver. Inside WSL, install `cuda-toolkit-12-x` from NVIDIA's WSL-Ubuntu repo. Never install the `cuda`, `cuda-12-x` or `cuda-drivers` meta-packages there: they try to install a Linux driver. `nvidia-smi` lives at `/usr/lib/wsl/lib/nvidia-smi`.
-- **Native Linux laptop:** keep the dGPU powered. Use `sudo prime-select on-demand` or `nvidia`, not `intel`, which unloads the NVIDIA driver so CUDA sees no device. CUDA programs need no PRIME offload variables.
-- **TensorRT:** `sudo apt install tensorrt-dev` from NVIDIA's CUDA apt repo, or a tar build matching your CUDA version (then pass `-DTENSORRT_ROOT=...`).
+From the repository root:
 
-```bash
-pip install torch torchvision onnx onnxscript onnxruntime
-python export_to_onnx.py
-cmake -S . -B build && cmake --build build -j
-./build/trt_resnet18 --io all
-./build/trt_resnet18 --help
+```cmd
+for %b in (1 2 4 8) do python export_to_onnx.py --batch %b --out-dir artifacts\batch%b
 ```
 
-The first run builds and caches engines; later runs deserialize them. The current engine cache filename includes precision and batch size (for example, `resnet18_fp16_b1.engine` and `resnet18_fp16_b2.engine`). An engine is tied to the GPU architecture and exact TensorRT version, and a cache older than its ONNX is rebuilt automatically.
+In a `.bat` file, write `%%b` instead of `%b`.
 
-## Benchmarking a laptop GPU without fooling yourself
+| Batch | `input.bin` | `ref_output.bin` | ONNX |
+|---:|---:|---:|---:|
+| 1 | 602,112 B | 4,000 B | 46,826,768 B |
+| 2 | 1,204,224 B | 8,000 B | 46,826,768 B |
+| 4 | 2,408,448 B | 16,000 B | 46,826,768 B |
+| 8 | 4,816,896 B | 32,000 B | 46,826,768 B |
 
-- **Power:** plug in AC and select the vendor's performance mode. On battery the GPU power limit is cut hard, and the numbers mean nothing.
-- **Watch clocks and the PCIe link while it runs.** Laptop links drop to Gen1 when idle, and the GPU throttles on temperature and power:
-  ```bash
-  nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu,pcie.link.gen.current,pcie.link.width.current --format=csv -l 1
-  ```
-  Write down the link generation and width under load: they set the ceiling for the H2D GB/s column.
-- **Optional:** lock clocks with `nvidia-smi --lock-gpu-clocks=<MHz>,<MHz>` (admin/root; some laptop SKUs refuse). Undo with `--reset-gpu-clocks`.
-- **OS overhead:** native Windows and WSL2 both submit work through the Windows WDDM driver. Expect higher per-launch overhead and more jitter than native Linux. Report p99, not only the mean, and state the OS next to every number.
-- **Repeatability:** run 3 times and report the median.
-- **Cross-check against NVIDIA's tool** (`trtexec` ships in TensorRT's `bin`):
-  ```bash
-  trtexec --onnx=resnet18.onnx --fp16 --noDataTransfers --useCudaGraph       # TensorRT 10.x
-  trtexec --onnx=resnet18_fp16.onnx                                          # TensorRT 11.x (--fp16 removed;
-                                                                             # no transfers + CUDA graphs are default)
-  ```
-  `trtexec` times the GPU work only, with CUDA graphs and no transfers. Expect it to beat this harness's end-to-end mean; the gap is your copy + launch overhead.
+## Build (Windows, CMD)
 
-## Observed results (Windows, TensorRT 10.15.1)
+Replace `C:/TensorRT` with your TensorRT install directory:
 
-Measurements are from the Windows native build on an NVIDIA GeForce RTX 3050 6GB Laptop GPU (sm_86), using FP16, pinned host I/O, 100 warmup iterations, and 500 measured iterations. Batch-specific ONNX and binary files are stored under `artifacts\batch1` and `artifacts\batch2`.
-
-These are repeat-run measurements, not a formal multi-run statistical benchmark. The first batch-1 run was unusually noisy, so the table below uses the subsequent repeat runs.
-
-| Precision | I/O    | Batch | Mean batch ms | p50 ms | p90 ms | p99 ms | H2D ms | H2D GB/s | Compute ms | Throughput (images/s) | Accuracy gate | Max diff |
-|-----------|--------|-------|---------------|--------|--------|--------|--------|-----------|------------|-----------------------|---------------|----------|
-| FP16      | pinned | 1     | 0.507         | 0.504  | 0.546  | 0.612  | 0.078  | 7.7       | 0.441      | 1973.3                | PASS (1/1)    | 1.44e-2  |
-| FP16      | pinned | 2     | 0.808         | 0.795  | 0.843  | 0.891  | 0.124  | 9.7       | 0.684      | 2475.2                | PASS (2/2)    | 1.27e-2  |
-
-Additional accuracy details:
-- Batch 1: mean absolute difference `3.13e-3`, cosine similarity `0.999997`.
-- Batch 2: mean absolute difference `2.68e-3`, cosine similarity `0.999998`.
-- Both batch sizes passed the configured accuracy gate.
-
-Interpretation:
-- Batch 1 has lower single-inference latency in these runs.
-- Batch 2 provides approximately 25.4% higher throughput than batch 1, while mean batch latency is approximately 59.4% higher.
-- Throughput is reported in **images/s**, not batches/s.
-- The first batch-1 run (mean 0.761 ms, p99 1.462 ms) was an outlier compared with its repeat (mean 0.507 ms, p99 0.612 ms); it is excluded from the repeat-run comparison.
-- The batch-2 repeat had a maximum latency of 1.495 ms and p99 of 0.891 ms. More repetitions are needed before claiming robust stability.
-
-## Design decisions
-
-- **Static batch size per exported ONNX.** The exporter accepts `--batch N` and emits a fixed `[N,3,224,224]` input. Each batch size uses its own ONNX, reference logits, and TensorRT engine cache.
-- **TF32 is its own mode.** TensorRT enables TF32 by default on sm_80+, so an unqualified "FP32" engine on any RTX 30-series card is really TF32. `kFP32` clears the flag to give a true baseline.
-- **FP32 I/O at every precision.** Host buffers and transfer sizes are identical across precisions, so the comparison isolates compute.
-- **A fair I/O comparison.** The frame is written once, outside the timed loop: into the pipeline's pinned/mapped buffer, or into a plain `std::vector` for pageable. Only the memory type changes between runs.
-- **Every copy runs on one non-blocking stream, with one sync per frame.** A plain `cudaMemcpy` would run on the legacy default stream, which does not order against a non-blocking stream. From pageable memory it can return before the DMA lands, so the kernels could read a half-written input.
-
-## Reproduce the current Windows benchmarks
-
-Run these from the project root after exporting the batch-specific ONNX and binary files:
-
-```bat
-build-win\Release\trt_resnet18.exe --batch 1 --precision fp16 --io pinned --onnx artifacts\batch1\resnet18.onnx --input artifacts\batch1\input.bin --ref artifacts\batch1\ref_output.bin --warmup 100 --iters 500
-
-build-win\Release\trt_resnet18.exe --batch 2 --precision fp16 --io pinned --onnx artifacts\batch2\resnet18.onnx --input artifacts\batch2\input.bin --ref artifacts\batch2\ref_output.bin --warmup 100 --iters 500
+```cmd
+cmake -S . -B build-win -G "Visual Studio 17 2022" -A x64 -DTENSORRT_ROOT=C:/TensorRT
+cmake --build build-win --config Release --parallel
+set PATH=C:\TensorRT\bin;%PATH%
 ```
 
-The `--batch` value must match the ONNX batch dimension and the sizes of both binary files. Current generated files:
-- `artifacts\batch1\input.bin` (602,112 bytes), `ref_output.bin` (4,000 bytes), `resnet18.onnx`
-- `artifacts\batch2\input.bin` (1,204,224 bytes), `ref_output.bin` (8,000 bytes), `resnet18.onnx`
+The executable is `build-win\Release\trt_resnet18.exe`.
+
+## Run
+
+Full precision × host-I/O matrix at batch 1:
+
+```cmd
+build-win\Release\trt_resnet18.exe --precision all --io all --batch 1 --onnx artifacts\batch1\resnet18.onnx --input artifacts\batch1\input.bin --ref artifacts\batch1\ref_output.bin --warmup 100 --iters 500
+```
+
+FP16 + pinned batch sweep:
+
+```cmd
+for %b in (1 2 4 8) do build-win\Release\trt_resnet18.exe --precision fp16 --io pinned --batch %b --onnx artifacts\batch%b\resnet18.onnx --input artifacts\batch%b\input.bin --ref artifacts\batch%b\ref_output.bin --warmup 100 --iters 500
+```
+
+Options: `--precision all|fp32|tf32|fp16`, `--io all|pinned|pageable|zerocopy`, `--batch N`, `--onnx`, `--input`, `--ref`, `--warmup`, `--iters`, `--workspace-mib`, `--rebuild`, `--verbose`. Shapes are static, so each batch size must use its own artifact folder.
+
+## Method
+
+- 100 warm-up and 500 timed iterations, with **two independent runs** per configuration. Tables show the mean of the two run-level results; percentile columns are averages of run-level percentiles, not pooled percentiles.
+- **End-to-end latency** is `std::chrono` wall time around one synchronized inference. **Stage times** (H2D / compute / D2H) come from CUDA events in a separate pass, so they need not sum exactly to end-to-end latency.
+- **Noise floor:** the pageable-minus-pinned penalty copies the same 602 KB at every precision, so it should be precision-independent. It measured 8–23 µs, which puts run-to-run noise at roughly ±15 µs. Differences smaller than that are treated as inconclusive.
+
+## Results
+
+### Precision × host I/O (batch 1)
+
+| Precision | I/O mode | Mean latency (ms) | Δ vs pinned (µs) |
+|---|---|---:|---:|
+| FP32 | pinned | 1.174 | — |
+| FP32 | pageable | 1.197 | +23 |
+| FP32 | zero-copy | 1.213 | +39 |
+| TF32 | pinned | 1.165 | — |
+| TF32 | pageable | 1.188 | +23 |
+| TF32 | zero-copy | 1.159 | −6 |
+| FP16 | pinned | 0.508 | — |
+| FP16 | pageable | 0.516 | +8 |
+| FP16 | zero-copy | 0.486 | −22 |
+
+**1. FP16 is 2.31× faster than FP32.** This is consistent with FP16 Tensor Core math plus halved memory traffic: the engine's activation memory drops from exactly 4.60 to 2.30 MiB.
+
+**2. TF32 gives no gain over FP32 on this GPU.** On GeForce Ampere (GA10x), dense TF32 Tensor Core peak throughput equals FP32 CUDA-core peak throughput (GA102 whitepaper; discussed [here](https://forums.developer.nvidia.com/t/tf32-tflops-of-geforce-rtx-3090-vs-a40/265828)). TF32's large uplift applies to datacenter parts such as A100, not to this laptop. Because TensorRT enables TF32 by default on SM ≥ 80, the FP32 mode explicitly disables it; otherwise the "FP32" baseline would silently be TF32.
+
+**3. Zero-copy's effect flips sign with precision.** It is +39 µs in FP32 and −22 µs in FP16, both above the ±15 µs noise floor; TF32's −6 µs is within noise. The cause is **unverified**. One hypothesis: the FP16 engine begins with a reformat layer that reads the FP32 input exactly once (the FP16 engine has 3 more layers than FP32: 26 vs 23). In the FP32 engine, conv1's overlapping 7×7 windows would instead re-read input bytes across PCIe. The layer dump listed under *Next steps* tests this directly.
+
+**4. Faster compute makes transfer matter more.** Batch-1 H2D is 78–80 µs: 6.6–6.8 % of FP32 latency but 15–16 % of FP16 latency (Amdahl's law). After FP16, the next gains are in transfer and launch overhead (CUDA Graphs, a smaller input format), not in the network itself.
+
+### H2D transfer model
+
+A least-squares fit of H2D time against transfer size over batch 1/2/4/8:
+
+$$
+t_{\mathrm{H2D}} \approx 32\ \mu\mathrm{s} + \frac{\text{bytes}}{12.8\ \mathrm{GB/s}}
+$$
+
+- R² = 0.9999 and the maximum residual is 1.5 µs, so a fixed cost plus a constant bandwidth describes these transfers well.
+- 12.8 GB/s is about 81 % of the 15.75 GB/s theoretical rate of a PCIe 4.0 ×8 (or 3.0 ×16) link, which is a typical DMA efficiency. The negotiated link was not recorded, so this is an inference, not a measurement.
+- The fixed cost explains why effective bandwidth rises with batch size (7.5 → 11.8 GB/s, below). The intercept bundles DMA setup with measurement overhead.
+
+### FP16 + pinned batch scaling
+
+| Batch | Mean latency (ms) | Run-mean range (ms) | ms / image | p50 (ms) | p90 (ms) | Throughput (img/s) | H2D (ms) | Effective H2D (GB/s) |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.5045 | 0.504–0.505 | 0.505 | 0.502 | 0.562 | 1,981.5 | 0.080 | 7.5 |
+| 2 | 0.8140 | 0.808–0.820 | 0.407 | 0.795 | 0.852 | 2,456.6 | 0.125 | 9.6 |
+| 4 | 1.3735 | 1.370–1.377 | 0.343 | 1.358 | 1.402 | 2,912.4 | 0.222 | 10.8 |
+| 8 | 2.1135 | 2.112–2.115 | 0.264 | 2.107 | 2.144 | 3,785.4 | 0.409 | 11.8 |
+
+Throughput is still rising at batch 8, so batch 1 leaves the GPU under-utilized. Batch 1 is still the right operating point for a single camera processing one frame at a time: batching only pays off when frames can be accumulated (multiple cameras, queued or offline work), and it costs latency.
+
+### Numerical parity (synthetic inputs)
+
+| Precision | Batch | Top-1 agreement | Max \|Δ\| | Mean \|Δ\| | Cosine similarity |
+|---|---:|---:|---:|---:|---:|
+| FP32 | 1 | 1/1 | 6.68e-6 | 7.98e-7 | 1.000000 |
+| FP16 | 1 | 1/1 | 1.44e-2 | 3.13e-3 | 0.999997 |
+| FP16 | 2 | 2/2 | 1.27e-2 | 2.68e-3 | 0.999998 |
+| FP16 | 4 | 4/4 | 1.34e-2 | 2.46e-3 | 0.999998 |
+| FP16 | 8 | 8/8 | 1.71e-2 | 3.18e-3 | 0.999997 |
+
+The FP32 row comes from the diagnostic run below. FP16's logit error is about 2,000× FP32's, yet the direction of the output vector is preserved (cosine ≥ 0.999997). TF32 metrics were not captured. Top-1 agreement counts synthetic samples only and is **not ImageNet accuracy**.
+
+### Engine build diagnostics (batch 1)
+
+These come from separate verbose rebuilds with only 10 warm-up and 20 timed iterations, so their latencies are not comparable with the 500-iteration results above.
+
+| Precision | Build time | Serialized plan | Engine layers | Activation memory | Mean latency | H2D | Compute | D2H |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| FP32 | 10.99 s | 58.83 MiB | 23 | 4.60 MiB | 2.178 ms | 0.081 ms | 2.056 ms | 0.008 ms |
+| FP16 | 21.81 s | 22.61 MiB | 26 | 2.30 MiB | 0.772 ms | 0.075 ms | 0.728 ms | 0.007 ms |
+
+- FP16 halves activation memory, shrinks the plan 2.6×, and takes about 2× longer to build because TensorRT times more candidate kernels.
+- FP32 measured 2.18 ms here vs. 1.17 ms in the main benchmark. That gap is consistent with GPU clocks not yet ramped up after only 10 warm-up iterations, which is why the main benchmark uses 100.
+
+## Design notes
+
+- **True FP32 baseline:** TensorRT enables TF32 by default on SM ≥ 80; the FP32 mode clears `BuilderFlag::kTF32`.
+- **Stream ordering:**
+  - All H2D copies, `enqueueV3` and D2H copies run on one `cudaStreamNonBlocking` stream, with a single `cudaStreamSynchronize` per inference.
+  - A plain `cudaMemcpy` runs on the legacy default stream, which does not synchronize with non-blocking streams. From pageable memory it can also return before the DMA completes, so the kernels could read a partially written input.
+- **Fair host-I/O comparison:** the input is written once, outside the timed loop, either into the pinned/mapped buffer or into a plain `std::vector` (pageable). Only the memory type changes between runs.
+- **FP32 I/O at every precision:** transfer sizes are identical across precisions; TensorRT converts at the network boundaries.
+- **Static shapes:** one ONNX model and one cached engine per (precision, batch) pair, so TensorRT picks the best kernel for each exact shape.
 
 ## Next steps
 
-- **CUDA Graphs.** Capture H2D + `enqueueV3` + D2H once and replay it. Under WDDM, launch overhead is a large share of a batch-1 ResNet-18, so this is the highest-value optimization on this laptop.
-- **GPU preprocessing.** Do resize, HWC→CHW and normalization in a CUDA kernel, or send `uint8` and fold normalization into the graph. Sending `uint8` also cuts H2D bytes by 4×, which the GB/s column will show directly.
-- **Batch sweep.** Use a dynamic-batch ONNX and an optimization profile, then plot latency and throughput against batch size per precision. FP16's advantage grows with batch size as kernels become compute-bound.
-- **INT8.** Use ModelOpt post-training quantization (explicit Q/DQ). Implicit calibration is deprecated in TensorRT 10 and removed in 11.
-- **Pipelining.** Use two contexts and two streams with double-buffered pinned I/O, so the copy for frame N+1 overlaps compute for frame N.
-- **ROS 2 node.** Subscribe to the TurtleBot's compressed image topic and publish detections, then measure end-to-end latency from camera to result.
+1. **Third run per configuration**; report median and range. A `--csv` output plus a sweep script would make the tables generated rather than hand-copied.
+2. **Hardware inventory** using the commands under *Hardware and software*.
+3. **Test the zero-copy hypothesis** with a per-layer dump of each engine:
+   ```cmd
+   trtexec --onnx=artifacts\batch1\resnet18.onnx --fp16 --profilingVerbosity=detailed --dumpLayerInfo
+   trtexec --onnx=artifacts\batch1\resnet18.onnx --noTF32 --profilingVerbosity=detailed --dumpLayerInfo
+   ```
+4. **Nsight Systems trace** of the timed loop, to see H2D, kernels and D2H on one timeline.
+5. **Capture TF32 numerical metrics**, then measure top-1 on **labeled real images**.
+6. **CUDA Graphs** and **GPU preprocessing / `uint8` input**, to attack the fixed transfer and launch overhead identified above.
+
+## License
+
+MIT. See [`LICENSE`](LICENSE).
